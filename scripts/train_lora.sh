@@ -4,7 +4,7 @@
 set -e
 
 # Default values
-DATASET_NAME="lambdalabs/pokemon-blip-captions"
+DATASET_NAME="diffusers/tuxemon"
 DATA_DIR=""
 OUTPUT_DIR="./checkpoints"
 RUN_NAME="lora_student_$(date +%Y%m%d_%H%M%S)"

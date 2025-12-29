@@ -4,27 +4,25 @@ __pycache__/
 *$py.class
 *.so
 .Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
 
 # Virtual environments
 venv/
 env/
 ENV/
-.venv
+
+# Output directories (exclude generated images and results)
+outputs/
+eval_outputs/
+test_outputs/
+benchmark_results/
+results_seed*/
+
+# Checkpoints and models (exclude trained weights)
+checkpoints/
+*.ckpt
+*.safetensors
+*.pt
+*.pth
 
 # IDE
 .vscode/
@@ -33,27 +31,18 @@ ENV/
 *.swo
 *~
 
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# Model checkpoints and outputs
-checkpoints/
-outputs/
-eval_outputs/
-*.ckpt
-*.safetensors
-*.pt
-*.pth
-
-# Logs
-*.log
-logs/
-
 # OS
 .DS_Store
 Thumbs.db
 
-# Hugging Face cache (optional - uncomment if you want to ignore)
-# .cache/
-# .huggingface/
+# Logs
+*.log
+wandb/
 
+# Data
+data/
+datasets/
+
+# Temporary files
+*.tmp
+*.temp

@@ -3,10 +3,10 @@
 Train a LoRA student model via distillation from a teacher SD1.5 model.
 
 This script implements few-step distillation aligned with Flash Diffusion / LCM-LoRA:
-- Teacher: Frozen SD1.5 UNet that solves from timestep t -> 0 using multiple steps with CFG
-- Student: SD1.5 UNet with trainable LoRA adapters that predicts at discrete few-step timesteps
-- Training: Student learns to match teacher's final z0 (denoised latent) from a single prediction
-- Loss: MSE between z0_student and z0_teacher
+- Teacher: Frozen SD1.5 UNet that provides CFG-guided predictions
+- Student: SD1.5 UNet with trainable LoRA adapters
+- Training: Student learns to match teacher's CFG-guided output (noise matching)
+- Loss: MSE between student prediction and teacher CFG prediction with Min-SNR weighting
 """
 
 import argparse
@@ -14,7 +14,7 @@ import os
 import random
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -28,7 +28,7 @@ from diffusers import (
     LCMScheduler,
     UNet2DConditionModel,
 )
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, get_peft_model, PeftModel
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
@@ -145,6 +145,48 @@ class ImageCaptionDataset(Dataset):
         return {"pixel_values": image_tensor, "text": caption}
 
 
+def compute_snr(noise_scheduler: DDPMScheduler, timesteps: torch.Tensor) -> torch.Tensor:
+    """
+    Compute Signal-to-Noise Ratio for given timesteps.
+    
+    SNR = alpha^2 / sigma^2 = alpha_cumprod / (1 - alpha_cumprod)
+    
+    Args:
+        noise_scheduler: The noise scheduler containing alphas_cumprod
+        timesteps: Tensor of timesteps
+    
+    Returns:
+        SNR values for each timestep
+    """
+    alphas_cumprod = noise_scheduler.alphas_cumprod.to(timesteps.device)
+    sqrt_alphas_cumprod = alphas_cumprod ** 0.5
+    sqrt_one_minus_alphas_cumprod = (1.0 - alphas_cumprod) ** 0.5
+    
+    alpha = sqrt_alphas_cumprod[timesteps]
+    sigma = sqrt_one_minus_alphas_cumprod[timesteps]
+    
+    snr = (alpha / sigma) ** 2
+    return snr
+
+
+def get_discrete_timesteps(num_train_timesteps: int = 1000, num_inference_steps: int = 4) -> List[int]:
+    """
+    Get discrete timesteps that match LCM inference schedule.
+    
+    For 4-step inference with 1000 timesteps: [875, 625, 375, 125]
+    
+    Args:
+        num_train_timesteps: Total number of training timesteps (usually 1000)
+        num_inference_steps: Number of inference steps (e.g., 4)
+    
+    Returns:
+        List of discrete timesteps
+    """
+    step_ratio = num_train_timesteps // num_inference_steps
+    timesteps = [(num_inference_steps - 1 - i) * step_ratio + step_ratio // 2 for i in range(num_inference_steps)]
+    return timesteps
+
+
 def prepare_models(
     base_model_id: str = "runwayml/stable-diffusion-v1-5",
     lora_rank: int = 4,
@@ -241,14 +283,18 @@ def compute_loss(
     teacher_steps: int = 50,
     student_steps: int = 4,
     guidance_scale: float = 7.5,
+    snr_gamma: float = 5.0,
+    use_discrete_timesteps: bool = True,
     device: str = "cuda",
     dtype: torch.dtype = torch.float16,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, Dict]:
     """
-    Compute distillation loss using few-step distillation aligned with Flash Diffusion / LCM-LoRA.
+    Compute distillation loss using noise-matching with Min-SNR weighting.
     
-    The teacher solves from timestep t to 0 using multiple steps with CFG.
-    The student predicts at timestep t and is trained to match the teacher's final z0.
+    This approach is more numerically stable than z0 reconstruction:
+    - Teacher: Produces CFG-guided noise prediction
+    - Student: Learns to match teacher's CFG output in a single forward pass
+    - Loss: MSE with Min-SNR weighting for stability at high timesteps
 
     Args:
         vae: VAE encoder/decoder
@@ -257,16 +303,18 @@ def compute_loss(
         teacher_unet: Frozen teacher UNet
         student_unet: Trainable student UNet
         noise_scheduler: DDPMScheduler for adding noise and alphas
-        teacher_scheduler: DDIMScheduler for teacher denoising
+        teacher_scheduler: DDIMScheduler (unused in noise-matching, kept for compatibility)
         batch: Batch of images and captions
-        teacher_steps: Number of steps for teacher denoising
-        student_steps: Unused (kept for compatibility)
+        teacher_steps: Unused (kept for compatibility)
+        student_steps: Number of inference steps (for discrete timestep sampling)
         guidance_scale: Guidance scale for teacher CFG
+        snr_gamma: Min-SNR gamma for loss weighting (higher = more uniform weighting)
+        use_discrete_timesteps: If True, sample from discrete timesteps matching inference
         device: Device
         dtype: Data type
 
     Returns:
-        Loss tensor (MSE between z0_student and z0_teacher)
+        Tuple of (loss, metrics_dict)
     """
     images = batch["pixel_values"].to(device, dtype=dtype)
     texts = batch["text"]
@@ -299,84 +347,97 @@ def compute_loss(
         all_embeddings = text_encoder(all_input_ids)[0]
         uncond_embeddings, text_embeddings = all_embeddings.chunk(2, dim=0)
 
-    # Sample training timesteps uniformly from [0, num_train_timesteps)
-    timesteps = torch.randint(
-        0,
-        noise_scheduler.config.num_train_timesteps,
-        (batch_size,),
-        device=device,
-    )
+    # Sample timesteps
+    if use_discrete_timesteps:
+        # Sample from discrete timesteps matching LCM inference schedule
+        discrete_timesteps = get_discrete_timesteps(
+            num_train_timesteps=noise_scheduler.config.num_train_timesteps,
+            num_inference_steps=student_steps,
+        )
+        timestep_indices = torch.randint(0, len(discrete_timesteps), (batch_size,))
+        timesteps = torch.tensor([discrete_timesteps[i] for i in timestep_indices], device=device, dtype=torch.long)
+    else:
+        # Uniform sampling (original behavior)
+        timesteps = torch.randint(
+            0,
+            noise_scheduler.config.num_train_timesteps,
+            (batch_size,),
+            device=device,
+        )
 
     # Add noise to latents using noise_scheduler (DDPMScheduler)
     noise = torch.randn_like(latents)
     noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-    # Teacher: Solve from t -> 0 using multiple steps with CFG
+    # Teacher: Single forward pass with CFG
     with torch.no_grad():
+        # Prepare inputs for CFG (concatenate unconditional and conditional)
+        latent_model_input = torch.cat([noisy_latents, noisy_latents], dim=0)
+        timestep_input = torch.cat([timesteps, timesteps], dim=0)
+        encoder_hidden_states = torch.cat([uncond_embeddings, text_embeddings], dim=0)
         
-        # Calculate stride for consistent schedule
-        stride = noise_scheduler.config.num_train_timesteps // teacher_steps  # e.g., 1000//50=20
+        # Teacher prediction
+        teacher_noise_pred = teacher_unet(
+            latent_model_input,
+            timestep_input,
+            encoder_hidden_states=encoder_hidden_states,
+        ).sample
         
-        z0_teacher_list = []
-        for b_idx in range(batch_size):
-            t0 = int(timesteps[b_idx].item())
-            z = noisy_latents[b_idx:b_idx+1]
-            
-            # Make a consistent schedule: t0, t0-stride, ..., 0 (clamped)
-            t_seq = list(range(t0, -1, -stride))
-            if t_seq[-1] != 0:
-                t_seq.append(0)
-            
-            # Set timesteps for DDIMScheduler once per batch (optimization)
-            if b_idx == 0:
-                teacher_scheduler.set_timesteps(teacher_steps, device=device)
-            
-            for step_idx, t_cur in enumerate(t_seq):
-                # Clamp timestep to valid range
-                t_cur = max(0, min(t_cur, teacher_scheduler.config.num_train_timesteps - 1))
-                t_tensor = torch.tensor([t_cur], device=device, dtype=torch.long)
-                
-                # CFG
-                z_cfg = torch.cat([z, z], dim=0)
-                t_cfg = torch.cat([t_tensor, t_tensor], dim=0)
-                emb_cfg = torch.cat([uncond_embeddings[b_idx:b_idx+1], text_embeddings[b_idx:b_idx+1]], dim=0)
-                
-                eps = teacher_unet(z_cfg, t_cfg, encoder_hidden_states=emb_cfg).sample
-                eps_u, eps_c = eps.chunk(2)
-                eps = eps_u + guidance_scale * (eps_c - eps_u)
-                
-                # DDIMScheduler.step() can handle arbitrary timesteps
-                z = teacher_scheduler.step(eps, t_cur, z).prev_sample
-            
-            z0_teacher_list.append(z)
-        
-        z0_teacher = torch.cat(z0_teacher_list, dim=0)
+        # Apply CFG
+        teacher_noise_pred_uncond, teacher_noise_pred_cond = teacher_noise_pred.chunk(2)
+        teacher_noise_pred_cfg = teacher_noise_pred_uncond + guidance_scale * (
+            teacher_noise_pred_cond - teacher_noise_pred_uncond
+        )
 
-    # Student: Single prediction at timestep t
-    student_pred = student_unet(
+    # Student: Single forward pass (no CFG - learns CFG-distilled behavior)
+    student_noise_pred = student_unet(
         noisy_latents,
         timesteps,
         encoder_hidden_states=text_embeddings,
     ).sample
-    
-    # Student z0 reconstruction using the SAME alphas as noise_scheduler (vectorized)
-    # Get alphas for all timesteps in batch at once
-    alphas = noise_scheduler.alphas_cumprod[timesteps].to(device=device, dtype=dtype)
-    alphas = alphas.view(-1, 1, 1, 1)  # Broadcast shape
-    z0_student = (noisy_latents - (1 - alphas).sqrt() * student_pred) / alphas.sqrt()
 
-    # Distillation loss: MSE between z0_student and z0_teacher
-    loss = F.mse_loss(z0_student.float(), z0_teacher.float(), reduction="mean")
+    # Compute Min-SNR weighted loss
+    # This prevents high-timestep samples from dominating the loss
+    snr = compute_snr(noise_scheduler, timesteps)
+    
+    # Min-SNR weighting: min(SNR, gamma) / SNR
+    # At high timesteps (low SNR): weight ≈ 1
+    # At low timesteps (high SNR): weight = gamma / SNR (downweighted)
+    mse_loss_weights = torch.clamp(snr, max=snr_gamma) / snr
+    mse_loss_weights = mse_loss_weights.to(device=device, dtype=dtype)
+    
+    # Compute per-sample MSE loss
+    loss_per_sample = F.mse_loss(
+        student_noise_pred.float(), 
+        teacher_noise_pred_cfg.float(), 
+        reduction="none"
+    )
+    loss_per_sample = loss_per_sample.mean(dim=[1, 2, 3])  # Mean over spatial dims
+    
+    # Apply Min-SNR weighting
+    loss = (loss_per_sample * mse_loss_weights).mean()
+    
+    # Compute metrics for logging
+    metrics = {
+        "loss": loss.item(),
+        "loss_unweighted": loss_per_sample.mean().item(),
+        "snr_mean": snr.mean().item(),
+        "snr_min": snr.min().item(),
+        "snr_max": snr.max().item(),
+        "timestep_mean": timesteps.float().mean().item(),
+        "student_pred_std": student_noise_pred.std().item(),
+        "teacher_pred_std": teacher_noise_pred_cfg.std().item(),
+    }
     
     # Verify loss is valid (not NaN or Inf)
     if torch.isnan(loss) or torch.isinf(loss):
         print(f"WARNING: Invalid loss detected! Loss = {loss.item()}")
-        print(f"  z0_student stats: min={z0_student.min().item():.4f}, max={z0_student.max().item():.4f}, mean={z0_student.mean().item():.4f}, std={z0_student.std().item():.4f}")
-        print(f"  z0_teacher stats: min={z0_teacher.min().item():.4f}, max={z0_teacher.max().item():.4f}, mean={z0_teacher.mean().item():.4f}, std={z0_teacher.std().item():.4f}")
+        print(f"  student_noise_pred stats: min={student_noise_pred.min().item():.4f}, max={student_noise_pred.max().item():.4f}")
+        print(f"  teacher_noise_pred_cfg stats: min={teacher_noise_pred_cfg.min().item():.4f}, max={teacher_noise_pred_cfg.max().item():.4f}")
         print(f"  Timesteps used: {timesteps.cpu().tolist()}")
-        print(f"  Batch size: {batch_size}")
+        print(f"  SNR values: {snr.cpu().tolist()}")
 
-    return loss
+    return loss, metrics
 
 
 def main() -> None:
@@ -440,19 +501,42 @@ def main() -> None:
         "--teacher_steps",
         type=int,
         default=20,
-        help="Number of steps for teacher denoising (fewer = faster training)",
+        help="Number of steps for teacher denoising (unused in noise-matching mode)",
     )
     parser.add_argument(
         "--student_steps",
         type=int,
         default=4,
-        help="Number of steps for student inference",
+        help="Number of steps for student inference (used for discrete timestep sampling)",
     )
     parser.add_argument(
         "--guidance_scale",
         type=float,
         default=7.5,
         help="Guidance scale for teacher classifier-free guidance",
+    )
+    parser.add_argument(
+        "--snr_gamma",
+        type=float,
+        default=5.0,
+        help="Min-SNR gamma for loss weighting (higher = more uniform, 5.0 recommended)",
+    )
+    parser.add_argument(
+        "--use_discrete_timesteps",
+        action="store_true",
+        default=True,
+        help="Use discrete timesteps matching inference schedule (recommended)",
+    )
+    parser.add_argument(
+        "--use_uniform_timesteps",
+        action="store_true",
+        help="Use uniform timestep sampling instead of discrete (not recommended)",
+    )
+    parser.add_argument(
+        "--max_grad_norm",
+        type=float,
+        default=1.0,
+        help="Max gradient norm for clipping (0 to disable)",
     )
     parser.add_argument(
         "--lora_rank",
@@ -472,8 +556,18 @@ def main() -> None:
         default=42,
         help="Random seed",
     )
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help="Path to checkpoint directory to resume from (e.g., './checkpoints/coco_lora_fast/lora/checkpoint-1000')",
+    )
 
     args = parser.parse_args()
+    
+    # Handle timestep sampling flags
+    if args.use_uniform_timesteps:
+        args.use_discrete_timesteps = False
 
     # Validate that dataset is provided
     if args.dataset_name is None and args.data_dir is None:
@@ -507,13 +601,125 @@ def main() -> None:
         persistent_workers=True,  # Keep workers alive between epochs
     )
 
+    # Resume from checkpoint if specified - need to handle this before preparing models
+    resume_step = 0
+    resume_checkpoint_path = None
+    if args.resume_from_checkpoint:
+        resume_checkpoint_path = Path(args.resume_from_checkpoint)
+        if not resume_checkpoint_path.exists():
+            raise ValueError(f"Checkpoint path does not exist: {resume_checkpoint_path}")
+        
+        # Load training metrics to get the step number
+        metrics_path = resume_checkpoint_path / "training_metrics.json"
+        if metrics_path.exists():
+            import json
+            with open(metrics_path, "r") as f:
+                metrics = json.load(f)
+            resume_step = metrics.get("global_step", 0)
+        else:
+            # Try to extract step number from checkpoint directory name
+            checkpoint_name = resume_checkpoint_path.name
+            if checkpoint_name.startswith("checkpoint-"):
+                try:
+                    resume_step = int(checkpoint_name.split("-")[1])
+                except ValueError:
+                    pass
+
     # Prepare models
-    vae, tokenizer, text_encoder, teacher_unet, student_unet, noise_scheduler, teacher_scheduler = prepare_models(
-        lora_rank=args.lora_rank,
-        lora_alpha=args.lora_alpha,
-        device=accelerator.device,
-        dtype=torch.float16,
-    )
+    # If resuming, we'll load the PEFT model from checkpoint instead of creating a new one
+    if args.resume_from_checkpoint:
+        # Load base model components first
+        from diffusers import AutoencoderKL, DDPMScheduler, DDIMScheduler, UNet2DConditionModel
+        from transformers import CLIPTokenizer, CLIPTextModel
+        
+        base_model_id = "runwayml/stable-diffusion-v1-5"
+        print(f"Loading base model: {base_model_id}")
+        
+        vae = AutoencoderKL.from_pretrained(
+            base_model_id,
+            subfolder="vae",
+            torch_dtype=torch.float16,
+        )
+        
+        teacher_unet = UNet2DConditionModel.from_pretrained(
+            base_model_id,
+            subfolder="unet",
+            torch_dtype=torch.float16,
+        )
+        teacher_unet.requires_grad_(False)
+        teacher_unet.eval()
+        
+        try:
+            teacher_unet = torch.compile(teacher_unet, mode="reduce-overhead")
+            print("✓ Teacher UNet compiled with torch.compile")
+        except Exception as e:
+            print(f"Note: torch.compile not available ({e}), using standard mode")
+        
+        # Load base UNet (without PEFT)
+        base_unet = UNet2DConditionModel.from_pretrained(
+            base_model_id,
+            subfolder="unet",
+            torch_dtype=torch.float16,
+        )
+        
+        # Load PEFT model directly from checkpoint
+        print(f"\n{'='*60}")
+        print(f"RESUMING FROM CHECKPOINT")
+        print(f"{'='*60}")
+        print(f"Loading checkpoint from: {resume_checkpoint_path}")
+        
+        # Load PEFT model from checkpoint
+        student_unet = PeftModel.from_pretrained(base_unet, resume_checkpoint_path)
+        
+        # Enable training mode
+        student_unet.train()
+        
+        # Disable inference mode in PEFT config to enable training
+        if hasattr(student_unet, 'peft_config') and student_unet.peft_config:
+            for adapter_name, config in student_unet.peft_config.items():
+                config.inference_mode = False
+        
+        # CRITICAL: Manually enable requires_grad for all LoRA parameters
+        # This ensures they are trainable even if loaded in inference mode
+        trainable_count = 0
+        for name, param in student_unet.named_parameters():
+            # LoRA parameters typically have 'lora' in their name
+            if 'lora' in name.lower():
+                param.requires_grad = True
+                trainable_count += 1
+        
+        student_unet.print_trainable_parameters()
+        print(f"✓ Loaded LoRA adapter weights from checkpoint")
+        print(f"✓ Manually enabled training for {trainable_count} LoRA parameters")
+        print(f"✓ Resuming from step {resume_step}")
+        
+        metrics_path = resume_checkpoint_path / "training_metrics.json"
+        if metrics_path.exists():
+            import json
+            with open(metrics_path, "r") as f:
+                metrics = json.load(f)
+            print(f"  Last checkpoint loss: {metrics.get('loss', 'N/A'):.6f}")
+            print(f"  Last checkpoint avg loss: {metrics.get('avg_loss', 'N/A'):.6f}")
+        
+        tokenizer = CLIPTokenizer.from_pretrained(base_model_id, subfolder="tokenizer")
+        text_encoder = CLIPTextModel.from_pretrained(
+            base_model_id, subfolder="text_encoder", torch_dtype=torch.float16
+        )
+        text_encoder.requires_grad_(False)
+        text_encoder.eval()
+        
+        noise_scheduler = DDPMScheduler.from_pretrained(base_model_id, subfolder="scheduler")
+        teacher_scheduler = DDIMScheduler.from_pretrained(base_model_id, subfolder="scheduler")
+        
+        print(f"{'='*60}\n")
+    else:
+        # Normal path: prepare models with new PEFT
+        vae, tokenizer, text_encoder, teacher_unet, student_unet, noise_scheduler, teacher_scheduler = prepare_models(
+            lora_rank=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            device=accelerator.device,
+            dtype=torch.float16,
+        )
 
     # Setup optimizer (only trainable LoRA parameters)
     trainable_params = [p for p in student_unet.parameters() if p.requires_grad]
@@ -541,11 +747,11 @@ def main() -> None:
         print(f"{'='*60}")
         
         # Model verification
-        trainable_params = sum(p.numel() for p in student_unet.parameters() if p.requires_grad)
+        trainable_params_count = sum(p.numel() for p in student_unet.parameters() if p.requires_grad)
         total_params = sum(p.numel() for p in student_unet.parameters())
         print(f"\n[Model Status]")
         print(f"  Student UNet in training mode: {student_unet.training}")
-        print(f"  Trainable parameters: {trainable_params:,} ({trainable_params/total_params*100:.2f}% of total)")
+        print(f"  Trainable parameters: {trainable_params_count:,} ({trainable_params_count/total_params*100:.2f}% of total)")
         print(f"  Total parameters: {total_params:,}")
         print(f"  Optimizer learning rate: {optimizer.param_groups[0]['lr']}")
         print(f"  Number of parameter groups: {len(optimizer.param_groups)}")
@@ -568,9 +774,20 @@ def main() -> None:
         print(f"    num_train_timesteps: {noise_scheduler.config.num_train_timesteps}")
         print(f"    beta_start: {noise_scheduler.config.beta_start}")
         print(f"    beta_end: {noise_scheduler.config.beta_end}")
-        print(f"  Teacher scheduler (DDIMScheduler):")
-        print(f"    num_train_timesteps: {teacher_scheduler.config.num_train_timesteps}")
-        print(f"    num_inference_steps: {getattr(teacher_scheduler.config, 'num_inference_steps', 'N/A')}")
+        
+        # Training method info
+        print(f"\n[Training Method]")
+        print(f"  Loss type: Noise-matching with Min-SNR weighting")
+        print(f"  SNR gamma: {args.snr_gamma}")
+        print(f"  Guidance scale: {args.guidance_scale}")
+        print(f"  Discrete timesteps: {args.use_discrete_timesteps}")
+        if args.use_discrete_timesteps:
+            discrete_ts = get_discrete_timesteps(
+                noise_scheduler.config.num_train_timesteps, 
+                args.student_steps
+            )
+            print(f"  Timesteps for {args.student_steps}-step inference: {discrete_ts}")
+        print(f"  Max gradient norm: {args.max_grad_norm}")
         
         # Warnings
         warnings = []
@@ -578,7 +795,7 @@ def main() -> None:
             warnings.append(f"  ⚠️  Teacher UNet has {teacher_trainable} trainable parameters (should be frozen)!")
         if text_encoder_trainable > 0:
             warnings.append(f"  ⚠️  Text encoder has {text_encoder_trainable} trainable parameters (should be frozen)!")
-        if trainable_params == 0:
+        if trainable_params_count == 0:
             warnings.append(f"  ❌ ERROR: No trainable parameters found! Training will not work!")
         if warnings:
             print(f"\n[Warnings]")
@@ -596,7 +813,7 @@ def main() -> None:
             
             # Test loss computation
             with torch.no_grad():
-                test_loss = compute_loss(
+                test_loss, test_metrics = compute_loss(
                     vae=vae,
                     tokenizer=tokenizer,
                     text_encoder=text_encoder,
@@ -608,18 +825,21 @@ def main() -> None:
                     teacher_steps=args.teacher_steps,
                     student_steps=args.student_steps,
                     guidance_scale=args.guidance_scale,
+                    snr_gamma=args.snr_gamma,
+                    use_discrete_timesteps=args.use_discrete_timesteps,
                     device=accelerator.device,
                     dtype=torch.float16,
                 )
             
             print(f"  ✅ Test forward pass successful!")
             print(f"  Test loss (no grad): {test_loss.item():.6f}")
+            print(f"  Test metrics: SNR mean={test_metrics['snr_mean']:.2f}, timestep mean={test_metrics['timestep_mean']:.0f}")
             
             # Test backward pass
             print(f"  Testing backward pass...")
             student_unet.train()
             optimizer.zero_grad()
-            test_loss_grad = compute_loss(
+            test_loss_grad, _ = compute_loss(
                 vae=vae,
                 tokenizer=tokenizer,
                 text_encoder=text_encoder,
@@ -631,6 +851,8 @@ def main() -> None:
                 teacher_steps=args.teacher_steps,
                 student_steps=args.student_steps,
                 guidance_scale=args.guidance_scale,
+                snr_gamma=args.snr_gamma,
+                use_discrete_timesteps=args.use_discrete_timesteps,
                 device=accelerator.device,
                 dtype=torch.float16,
             )
@@ -667,19 +889,25 @@ def main() -> None:
     
     # Training loop
     student_unet.train()
-    global_step = 0
-    progress_bar = tqdm(range(args.max_steps), disable=not accelerator.is_local_main_process)
+    global_step = resume_step
+    progress_bar = tqdm(range(args.max_steps), initial=resume_step, disable=not accelerator.is_local_main_process)
 
     print(f"\n{'='*60}")
     print(f"TRAINING CONFIGURATION")
     print(f"{'='*60}")
-    print(f"Starting training for {args.max_steps} steps...")
+    if resume_step > 0:
+        print(f"Resuming training from step {resume_step} to {args.max_steps} steps...")
+        print(f"Remaining steps: {args.max_steps - resume_step}")
+    else:
+        print(f"Starting training for {args.max_steps} steps...")
     print(f"Output directory: {output_dir}")
     print(f"Batch size: {args.batch_size}")
     print(f"Gradient accumulation steps: {args.gradient_accumulation_steps}")
     print(f"Effective batch size: {args.batch_size * args.gradient_accumulation_steps}")
     print(f"Learning rate: {args.learning_rate}")
     print(f"LoRA rank: {args.lora_rank}, LoRA alpha: {args.lora_alpha}")
+    print(f"SNR gamma: {args.snr_gamma}")
+    print(f"Max gradient norm: {args.max_grad_norm}")
     print(f"Dataset size: {len(dataset)}")
     print(f"Device: {accelerator.device}")
     if torch.cuda.is_available():
@@ -703,7 +931,7 @@ def main() -> None:
             
             with accelerator.accumulate(student_unet):
                 # Compute loss
-                loss = compute_loss(
+                loss, metrics = compute_loss(
                     vae=vae,
                     tokenizer=tokenizer,
                     text_encoder=text_encoder,
@@ -715,6 +943,8 @@ def main() -> None:
                     teacher_steps=args.teacher_steps,
                     student_steps=args.student_steps,
                     guidance_scale=args.guidance_scale,
+                    snr_gamma=args.snr_gamma,
+                    use_discrete_timesteps=args.use_discrete_timesteps,
                     device=accelerator.device,
                     dtype=torch.float16,
                 )
@@ -725,11 +955,17 @@ def main() -> None:
                 # Calculate gradient norm before optimizer step
                 grad_norm = 0.0
                 if accelerator.sync_gradients:
-                    # Get gradient norm for trainable parameters
-                    for param in student_unet.parameters():
-                        if param.grad is not None:
-                            grad_norm += param.grad.data.norm(2).item() ** 2
-                    grad_norm = grad_norm ** 0.5
+                    # Gradient clipping
+                    if args.max_grad_norm > 0:
+                        grad_norm = accelerator.clip_grad_norm_(trainable_params, args.max_grad_norm)
+                        if hasattr(grad_norm, 'item'):
+                            grad_norm = grad_norm.item()
+                    else:
+                        # Just compute gradient norm for logging
+                        for param in student_unet.parameters():
+                            if param.grad is not None:
+                                grad_norm += param.grad.data.norm(2).item() ** 2
+                        grad_norm = grad_norm ** 0.5
                     gradient_norm_history.append(grad_norm)
                 
                 optimizer.step()
@@ -740,7 +976,7 @@ def main() -> None:
                     step_time = time.time() - step_start_time
                     step_times.append(step_time)
                     global_step += 1
-                    loss_value = loss.item()
+                    loss_value = metrics["loss"]
                     loss_history.append(loss_value)
                     
                     progress_bar.update(1)
@@ -758,7 +994,7 @@ def main() -> None:
                         images_per_sec = args.batch_size * args.gradient_accumulation_steps / avg_step_time if avg_step_time > 0 else 0.0
                         
                         elapsed_time = time.time() - training_start_time
-                        steps_per_sec = global_step / elapsed_time if elapsed_time > 0 else 0.0
+                        steps_per_sec = (global_step - resume_step) / elapsed_time if elapsed_time > 0 else 0.0
                         remaining_steps = args.max_steps - global_step
                         eta_seconds = remaining_steps / steps_per_sec if steps_per_sec > 0 else 0.0
                         eta_minutes = eta_seconds / 60.0
@@ -766,6 +1002,9 @@ def main() -> None:
                         print(f"\n[Step {global_step}/{args.max_steps}]")
                         print(f"  Loss: {loss_value:.6f} (avg over last {log_interval}: {avg_loss:.6f})")
                         print(f"  Gradient norm: {grad_norm:.4f} (avg: {avg_grad_norm:.4f})")
+                        print(f"  SNR: mean={metrics['snr_mean']:.2f}, min={metrics['snr_min']:.4f}, max={metrics['snr_max']:.2f}")
+                        print(f"  Timestep mean: {metrics['timestep_mean']:.0f}")
+                        print(f"  Pred std: student={metrics['student_pred_std']:.4f}, teacher={metrics['teacher_pred_std']:.4f}")
                         print(f"  Learning rate: {optimizer.param_groups[0]['lr']:.2e}")
                         print(f"  Speed: {avg_step_time:.3f}s/step, {images_per_sec:.2f} images/sec, {steps_per_sec:.2f} steps/sec")
                         print(f"  ETA: {eta_minutes:.1f} minutes ({eta_seconds:.0f} seconds)")
@@ -776,7 +1015,7 @@ def main() -> None:
                             print(f"  GPU Memory: {mem_allocated:.2f} GB allocated, {mem_reserved:.2f} GB reserved")
                         
                         # Check if model parameters are updating
-                        if global_step == log_interval:
+                        if global_step == log_interval + resume_step:
                             # Get a sample parameter to check if it's changing
                             sample_param = None
                             for param in student_unet.parameters():
@@ -793,21 +1032,23 @@ def main() -> None:
                         unwrapped_model.save_pretrained(checkpoint_dir)
                         
                         # Save training metrics
-                        metrics = {
+                        checkpoint_metrics = {
                             "global_step": global_step,
                             "loss": loss_value,
                             "avg_loss": sum(loss_history[-100:]) / min(100, len(loss_history)) if loss_history else 0.0,
                             "grad_norm": grad_norm,
                             "learning_rate": optimizer.param_groups[0]['lr'],
                             "epoch": epoch + 1,
+                            "snr_gamma": args.snr_gamma,
+                            "guidance_scale": args.guidance_scale,
                         }
                         import json
                         with open(checkpoint_dir / "training_metrics.json", "w") as f:
-                            json.dump(metrics, f, indent=2)
+                            json.dump(checkpoint_metrics, f, indent=2)
                         
                         print(f"\n[Step {global_step}] Saved checkpoint to {checkpoint_dir}")
                         print(f"  Current loss: {loss_value:.6f}")
-                        print(f"  Average loss (last 100 steps): {metrics['avg_loss']:.6f}")
+                        print(f"  Average loss (last 100 steps): {checkpoint_metrics['avg_loss']:.6f}")
                         if torch.cuda.is_available():
                             print(f"  GPU Memory: {torch.cuda.memory_allocated(accelerator.device) / 1e9:.2f} GB")
 
@@ -832,8 +1073,8 @@ def main() -> None:
         print(f"{'='*60}")
         print(f"Total steps: {global_step}")
         print(f"Total training time: {total_training_time / 60:.2f} minutes ({total_training_time:.2f} seconds)")
-        print(f"Average time per step: {total_training_time / global_step:.3f} seconds")
-        print(f"Average steps per second: {global_step / total_training_time:.2f}")
+        print(f"Average time per step: {total_training_time / (global_step - resume_step):.3f} seconds")
+        print(f"Average steps per second: {(global_step - resume_step) / total_training_time:.2f}")
         
         if loss_history:
             final_loss = loss_history[-1]
@@ -848,7 +1089,15 @@ def main() -> None:
             print(f"  Average loss: {avg_loss:.6f}")
             print(f"  Min loss: {min_loss:.6f}")
             print(f"  Max loss: {max_loss:.6f}")
-            print(f"  Loss reduction: {initial_loss - final_loss:.6f} ({((initial_loss - final_loss) / initial_loss * 100):.2f}%)")
+            loss_change = initial_loss - final_loss
+            loss_change_pct = (loss_change / initial_loss * 100) if initial_loss != 0 else 0
+            print(f"  Loss change: {loss_change:.6f} ({loss_change_pct:.2f}%)")
+            
+            # Check if training was successful
+            if loss_change > 0:
+                print(f"  ✅ Loss decreased during training (good!)")
+            else:
+                print(f"  ⚠️  Loss increased during training (check hyperparameters)")
         
         if gradient_norm_history:
             avg_grad_norm = sum(gradient_norm_history) / len(gradient_norm_history)
@@ -864,10 +1113,19 @@ def main() -> None:
             "total_steps": global_step,
             "total_training_time_seconds": total_training_time,
             "total_training_time_minutes": total_training_time / 60,
-            "avg_time_per_step": total_training_time / global_step if global_step > 0 else 0,
-            "avg_steps_per_second": global_step / total_training_time if total_training_time > 0 else 0,
+            "avg_time_per_step": total_training_time / (global_step - resume_step) if (global_step - resume_step) > 0 else 0,
+            "avg_steps_per_second": (global_step - resume_step) / total_training_time if total_training_time > 0 else 0,
             "loss_history": loss_history[-100:] if len(loss_history) > 100 else loss_history,  # Last 100 steps
             "gradient_norm_history": gradient_norm_history[-100:] if len(gradient_norm_history) > 100 else gradient_norm_history,
+            "training_config": {
+                "snr_gamma": args.snr_gamma,
+                "guidance_scale": args.guidance_scale,
+                "use_discrete_timesteps": args.use_discrete_timesteps,
+                "student_steps": args.student_steps,
+                "max_grad_norm": args.max_grad_norm,
+                "lora_rank": args.lora_rank,
+                "lora_alpha": args.lora_alpha,
+            }
         }
         if loss_history:
             final_metrics.update({

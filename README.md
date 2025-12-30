@@ -21,18 +21,13 @@ A research implementation of teacher-student distillation for accelerating diffu
 
 ## Demo & Evaluation
 
-The demo script (`demo.py`) provides comprehensive evaluation:
-
-- **Fast Generation**: Flash Diffusion LoRA in 2, 4, or 8 steps
-- **Baseline Comparison**: Quality and speed metrics vs. vanilla SD1.5 (30 steps)
-- **Quality Metrics**: Official CLIPScore (text-image semantic similarity)
-- **Automated Benchmarking**: Batch evaluation with statistical analysis
+Comprehensive evaluation framework with baseline comparison and quality metrics:
 
 ```bash
 # Fast generation
 python demo.py --prompt "a beautiful landscape" --steps 2 4 8
 
-# Comprehensive benchmark
+# Benchmark with baseline comparison
 python demo.py \
   --compare_baseline \
   --prompts_file demo_prompts.txt \
@@ -41,15 +36,21 @@ python demo.py \
   --seed 42
 ```
 
+**Features**:
+- Official CLIPScore evaluation (text-image semantic similarity)
+- CUDA-synchronized timing for accurate benchmarks
+- Side-by-side comparison grids
+- Automated CSV/JSON reporting
+
 ## Training
 
-Full training pipeline for distilling custom LoRA adapters from scratch:
+Teacher-student distillation with noise-matching and Min-SNR weighting:
 
-**Method**: Teacher-student distillation aligned with Flash Diffusion / LCM-LoRA
-- **Teacher**: SD1.5 with DDIM scheduler, denoises t→0 in 50 steps with CFG=7.5
-- **Student**: SD1.5 + trainable LoRA (~4M parameters) at discrete few-step timesteps
-- **Loss**: MSE between student and teacher z₀ (denoised latent) reconstructions
-- **Training**: Samples from discrete student schedule, teacher provides multi-step targets
+**Method**:
+- **Teacher**: Frozen SD1.5, single forward pass with CFG (guidance_scale=7.5)
+- **Student**: SD1.5 + trainable LoRA (~4M parameters), learns to match teacher's CFG output
+- **Loss**: MSE with Min-SNR weighting (prevents high-timestep dominance)
+- **Timesteps**: Discrete sampling matching LCM inference schedule (optional)
 
 ```bash
 # Train on HuggingFace dataset
@@ -60,7 +61,9 @@ python train_student_lora.py \
   --max_steps 2000 \
   --batch_size 1 \
   --gradient_accumulation_steps 4 \
-  --learning_rate 1e-4
+  --learning_rate 1e-4 \
+  --snr_gamma 5.0 \
+  --use_discrete_timesteps
 
 # Evaluate trained LoRA
 python demo.py \
@@ -69,20 +72,20 @@ python demo.py \
   --prompt "your prompt here"
 ```
 
-**Implementation Details**:
-- `DDPMScheduler` for noise addition and alpha consistency
-- `LCMScheduler` for student inference with trailing timestep spacing
-- Multi-step teacher denoising with proper timestep sequencing
+**Implementation**:
+- Noise-matching (more stable than z0 reconstruction)
+- Min-SNR weighting for balanced training across timesteps
+- Discrete timestep sampling aligned with inference schedule
+- FP16 training with Accelerate, gradient accumulation
 - Only LoRA parameters trainable (base model frozen)
-- FP16 training with Accelerate, gradient accumulation for memory efficiency
 
 ## Technical Details
 
 - **Base Model**: Stable Diffusion v1.5 (runwayml/stable-diffusion-v1-5)
 - **LoRA**: Rank-4 on UNet attention layers (to_k, to_q, to_v, to_out.0)
 - **Scheduler**: LCMScheduler with trailing timestep spacing
-- **Inference**: No CFG (guidance_scale=0) for LCM-style generation
-- **Evaluation**: Official CLIPScore formula (100 × max(0, cosine_similarity))
+- **Inference**: Low guidance scale (default=1.0) for LCM-style generation
+- **Evaluation**: Official CLIPScore (100 × max(0, cosine_similarity))
 
 ## Installation
 

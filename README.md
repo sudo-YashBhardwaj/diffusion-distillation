@@ -44,26 +44,26 @@ python demo.py \
 
 ## Training
 
-Teacher-student distillation with noise-matching and Min-SNR weighting:
+K-step distillation aligned with Flash Diffusion / LCM-LoRA:
 
 **Method**:
-- **Teacher**: Frozen SD1.5, single forward pass with CFG (guidance_scale=7.5)
-- **Student**: SD1.5 + trainable LoRA (~4M parameters), learns to match teacher's CFG output
-- **Loss**: MSE with Min-SNR weighting (prevents high-timestep dominance)
-- **Timesteps**: Discrete sampling matching LCM inference schedule (optional)
+- **Teacher**: Frozen SD1.5, performs K DDIM steps from timestep t with CFG (guidance_scale=7.5)
+- **Student**: SD1.5 + trainable LoRA (~4M parameters), learns to match teacher's K-step output in one forward pass
+- **Loss**: MSE between student's single-step prediction and teacher's multi-step target
+- **Key Insight**: Student learns to skip multiple denoising steps at once
 
 ```bash
 # Train on HuggingFace dataset
-python train_student_lora.py \
-  --dataset_name "diffusers/tuxemon" \
+python train_flash_lora.py \
+  --dataset_name "lambdalabs/pokemon-blip-captions" \
   --output_dir ./checkpoints \
   --run_name "my_lora" \
   --max_steps 2000 \
   --batch_size 1 \
   --gradient_accumulation_steps 4 \
   --learning_rate 1e-4 \
-  --snr_gamma 5.0 \
-  --use_discrete_timesteps
+  --num_ddim_steps 10 \
+  --num_inference_steps 4
 
 # Evaluate trained LoRA
 python demo.py \
@@ -73,9 +73,9 @@ python demo.py \
 ```
 
 **Implementation**:
-- Noise-matching (more stable than z0 reconstruction)
-- Min-SNR weighting for balanced training across timesteps
-- Discrete timestep sampling aligned with inference schedule
+- Teacher performs K DDIM steps with CFG to produce target latents
+- Student predicts target in single forward pass (no CFG)
+- Discrete timestep sampling from LCM inference schedule
 - FP16 training with Accelerate, gradient accumulation
 - Only LoRA parameters trainable (base model frozen)
 

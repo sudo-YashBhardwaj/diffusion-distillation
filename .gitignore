@@ -46,3 +46,6 @@ datasets/
 # Temporary files
 *.tmp
 *.temp
+
+# NFS lock files
+.nfs*

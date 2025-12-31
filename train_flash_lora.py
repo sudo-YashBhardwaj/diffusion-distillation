@@ -13,6 +13,7 @@ it learns to SKIP multiple denoising steps at once.
 
 import argparse
 import json
+import logging
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -28,12 +29,31 @@ from diffusers import (
     DDIMScheduler,
     UNet2DConditionModel,
 )
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, get_peft_model, PeftModel
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
 from transformers import CLIPTokenizer, CLIPTextModel
 from tqdm.auto import tqdm
+
+# Setup logging
+def setup_logging(log_file: Optional[str] = None):
+    """Setup logging with optional file output."""
+    handlers = [
+        logging.StreamHandler(),  # Console output
+    ]
+    if log_file:
+        handlers.append(logging.FileHandler(log_file))
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+        handlers=handlers
+    )
+    return logging.getLogger(__name__)
+
+logger = logging.getLogger(__name__)
 
 
 # =============================================================================
@@ -360,11 +380,31 @@ def compute_loss(
     
     loss = F.mse_loss(student_outputs.float(), teacher_targets.float())
     
+    # Validation checks
+    if torch.isnan(loss) or torch.isinf(loss):
+        logger.error(f"Invalid loss detected: {loss.item()}")
+        logger.error(f"  Student outputs: min={student_outputs.min().item():.4f}, max={student_outputs.max().item():.4f}, std={student_outputs.std().item():.4f}")
+        logger.error(f"  Teacher targets: min={teacher_targets.min().item():.4f}, max={teacher_targets.max().item():.4f}, std={teacher_targets.std().item():.4f}")
+        logger.error(f"  Timesteps: {timesteps.cpu().tolist()}")
+        raise ValueError("NaN or Inf loss detected!")
+    
+    # Compute additional metrics
+    with torch.no_grad():
+        mse_per_sample = F.mse_loss(student_outputs.float(), teacher_targets.float(), reduction='none').mean(dim=[1,2,3])
+        max_error = mse_per_sample.max().item()
+        min_error = mse_per_sample.min().item()
+    
     metrics = {
         "loss": loss.item(),
         "timestep_mean": timesteps.float().mean().item(),
+        "timestep_min": timesteps.min().item(),
+        "timestep_max": timesteps.max().item(),
         "student_std": student_outputs.std().item(),
         "teacher_std": teacher_targets.std().item(),
+        "student_mean": student_outputs.mean().item(),
+        "teacher_mean": teacher_targets.mean().item(),
+        "max_error": max_error,
+        "min_error": min_error,
     }
     
     return loss, metrics
@@ -381,16 +421,23 @@ def prepare_models(
     dtype: torch.dtype = torch.float16,
 ):
     """Load and prepare teacher/student models."""
-    print(f"Loading base model: {base_model_id}")
+    logger.info(f"Loading base model: {base_model_id}")
 
+    logger.info("Loading VAE...")
     vae = AutoencoderKL.from_pretrained(base_model_id, subfolder="vae", torch_dtype=dtype)
+    vae.requires_grad_(False)
+    vae.eval()
     
     # Teacher (frozen)
+    logger.info("Loading teacher UNet (frozen)...")
     teacher_unet = UNet2DConditionModel.from_pretrained(base_model_id, subfolder="unet", torch_dtype=dtype)
     teacher_unet.requires_grad_(False)
     teacher_unet.eval()
+    teacher_params = sum(p.numel() for p in teacher_unet.parameters())
+    logger.info(f"  Teacher UNet parameters: {teacher_params:,} (frozen)")
 
     # Student (with LoRA)
+    logger.info("Loading student UNet with LoRA...")
     student_unet = UNet2DConditionModel.from_pretrained(base_model_id, subfolder="unet", torch_dtype=dtype)
     lora_config = LoraConfig(
         r=lora_rank,
@@ -399,15 +446,24 @@ def prepare_models(
         lora_dropout=0.0,
     )
     student_unet = get_peft_model(student_unet, lora_config)
-    student_unet.print_trainable_parameters()
+    
+    # Log trainable parameters
+    trainable_params = sum(p.numel() for p in student_unet.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in student_unet.parameters())
+    logger.info(f"  Student UNet - Trainable: {trainable_params:,} ({100*trainable_params/total_params:.2f}%)")
+    logger.info(f"  Student UNet - Total: {total_params:,}")
 
+    logger.info("Loading tokenizer and text encoder...")
     tokenizer = CLIPTokenizer.from_pretrained(base_model_id, subfolder="tokenizer")
     text_encoder = CLIPTextModel.from_pretrained(base_model_id, subfolder="text_encoder", torch_dtype=dtype)
     text_encoder.requires_grad_(False)
     text_encoder.eval()
+    logger.info(f"  Text encoder parameters: {sum(p.numel() for p in text_encoder.parameters()):,} (frozen)")
 
+    logger.info("Loading schedulers...")
     noise_scheduler = DDPMScheduler.from_pretrained(base_model_id, subfolder="scheduler")
     ddim_scheduler = DDIMScheduler.from_pretrained(base_model_id, subfolder="scheduler")
+    logger.info(f"  Noise scheduler timesteps: {noise_scheduler.config.num_train_timesteps}")
 
     return vae, tokenizer, text_encoder, teacher_unet, student_unet, noise_scheduler, ddim_scheduler
 
@@ -433,8 +489,27 @@ def main():
     parser.add_argument("--num_inference_steps", type=int, default=4, help="Target inference steps")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help="Path to checkpoint directory to resume from (e.g., './checkpoints/run_name/lora/checkpoint-1000')"
+    )
+    parser.add_argument(
+        "--log_file",
+        type=str,
+        default=None,
+        help="Path to log file (default: training_<run_name>.log)"
+    )
     
     args = parser.parse_args()
+    
+    # Setup logging with file output
+    if args.log_file is None:
+        args.log_file = f"training_{args.run_name}.log"
+    global logger
+    logger = setup_logging(args.log_file)
+    logger.info(f"Logging to: {args.log_file}")
     
     set_seed(args.seed)
     
@@ -444,15 +519,20 @@ def main():
     )
 
     # Dataset
+    logger.info("Loading dataset...")
     dataset = ImageCaptionDataset(
         dataset_name=args.dataset_name if not args.data_dir else None,
         data_dir=args.data_dir,
     )
+    logger.info(f"  Dataset size: {len(dataset):,} samples")
     
     dataloader = torch.utils.data.DataLoader(
         dataset, batch_size=args.batch_size, shuffle=True,
         num_workers=4, pin_memory=True,
     )
+    logger.info(f"  Batch size: {args.batch_size}")
+    logger.info(f"  Gradient accumulation: {args.gradient_accumulation_steps}")
+    logger.info(f"  Effective batch size: {args.batch_size * args.gradient_accumulation_steps}")
 
     # Models
     vae, tokenizer, text_encoder, teacher_unet, student_unet, noise_scheduler, ddim_scheduler = prepare_models(
@@ -460,17 +540,89 @@ def main():
         lora_alpha=args.lora_alpha,
     )
 
+    # Check if resuming from checkpoint
+    global_step = 0
+    loss_history = []
+    resume_from_checkpoint = args.resume_from_checkpoint
+    
+    if resume_from_checkpoint:
+        checkpoint_path = Path(resume_from_checkpoint)
+        if not checkpoint_path.exists():
+            raise ValueError(f"Checkpoint path does not exist: {checkpoint_path}")
+        
+        logger.info(f"Resuming from checkpoint: {checkpoint_path}")
+        
+        # Load checkpoint info if available
+        checkpoint_info_path = checkpoint_path / "checkpoint_info.json"
+        if checkpoint_info_path.exists():
+            with open(checkpoint_info_path, "r") as f:
+                checkpoint_info = json.load(f)
+                global_step = checkpoint_info.get("global_step", 0)
+                loss_history = checkpoint_info.get("loss_history", [])
+                logger.info(f"  Resuming from step: {global_step}")
+                logger.info(f"  Previous loss history: {len(loss_history)} steps")
+                if loss_history:
+                    logger.info(f"  Last loss: {loss_history[-1]:.6f}")
+        else:
+            # Try to infer step from checkpoint directory name (e.g., checkpoint-1500)
+            checkpoint_name = checkpoint_path.name
+            if checkpoint_name.startswith("checkpoint-"):
+                try:
+                    global_step = int(checkpoint_name.split("-")[1])
+                    logger.info(f"  No checkpoint_info.json found, inferring step from directory name: {global_step}")
+                except ValueError:
+                    logger.warning(f"  Could not infer step from directory name, starting from step 0")
+                    global_step = 0
+            else:
+                logger.warning(f"  Could not infer step from directory name, starting from step 0")
+                global_step = 0
+        
+        # Load LoRA weights BEFORE preparing with Accelerate (simpler and more reliable)
+        logger.info("Loading LoRA weights from checkpoint...")
+        checkpoint_path = Path(resume_from_checkpoint)
+        try:
+            # Load using PeftModel - this preserves the model structure
+            student_unet = PeftModel.from_pretrained(student_unet, checkpoint_path)
+            # Ensure model is in training mode
+            student_unet.train()
+            # Verify trainable parameters exist
+            trainable_after = [p for p in student_unet.parameters() if p.requires_grad]
+            if len(trainable_after) == 0:
+                logger.warning("  No trainable parameters after loading - enabling all LoRA params")
+                for name, param in student_unet.named_parameters():
+                    if 'lora' in name.lower():
+                        param.requires_grad = True
+                trainable_after = [p for p in student_unet.parameters() if p.requires_grad]
+            logger.info(f"  ✓ LoRA weights loaded")
+            logger.info(f"  Trainable parameters: {sum(p.numel() for p in trainable_after):,}")
+        except Exception as e:
+            logger.warning(f"  ⚠ Could not load checkpoint: {e}")
+            logger.warning("  Continuing with fresh LoRA weights (checkpoint may be incompatible)")
+
     # Optimizer
+    trainable_params = [p for p in student_unet.parameters() if p.requires_grad]
+    if len(trainable_params) == 0:
+        raise ValueError("No trainable parameters found! Check LoRA configuration.")
     optimizer = torch.optim.AdamW(
-        [p for p in student_unet.parameters() if p.requires_grad],
+        trainable_params,
         lr=args.learning_rate,
     )
+    logger.info(f"Optimizer: AdamW with lr={args.learning_rate}")
+    logger.info(f"  Trainable parameters: {sum(p.numel() for p in trainable_params):,}")
 
     # Prepare
+    logger.info("Preparing models with Accelerate...")
     student_unet, optimizer, dataloader = accelerator.prepare(student_unet, optimizer, dataloader)
     vae = vae.to(accelerator.device)
     text_encoder = text_encoder.to(accelerator.device)
     teacher_unet = teacher_unet.to(accelerator.device)
+    
+    # Log device info
+    logger.info(f"Device: {accelerator.device}")
+    if torch.cuda.is_available():
+        logger.info(f"  GPU: {torch.cuda.get_device_name(accelerator.device)}")
+        logger.info(f"  GPU Memory: {torch.cuda.get_device_properties(accelerator.device).total_memory / 1e9:.1f} GB")
+        torch.cuda.reset_peak_memory_stats()
 
     # Output
     output_dir = Path(args.output_dir) / args.run_name / "lora"
@@ -479,26 +631,34 @@ def main():
     # Training info
     inference_timesteps = get_lcm_timesteps(noise_scheduler.config.num_train_timesteps, args.num_inference_steps)
     
-    print(f"\n{'='*60}")
-    print("FLASH DIFFUSION TRAINING")
-    print(f"{'='*60}")
-    print(f"Method: K-step teacher rollout distillation")
-    print(f"Teacher DDIM steps: {args.num_ddim_steps}")
-    print(f"Target inference steps: {args.num_inference_steps}")
-    print(f"Training timesteps: {inference_timesteps}")
-    print(f"Teacher CFG scale: {args.guidance_scale}")
-    print(f"LoRA rank: {args.lora_rank}")
-    print(f"Max steps: {args.max_steps}")
-    print(f"Output: {output_dir}")
-    print(f"{'='*60}\n")
+    logger.info(f"\n{'='*60}")
+    logger.info("FLASH DIFFUSION TRAINING")
+    logger.info(f"{'='*60}")
+    logger.info(f"Method: K-step teacher rollout distillation")
+    logger.info(f"Teacher DDIM steps: {args.num_ddim_steps}")
+    logger.info(f"Target inference steps: {args.num_inference_steps}")
+    logger.info(f"Training timesteps: {inference_timesteps}")
+    logger.info(f"Teacher CFG scale: {args.guidance_scale}")
+    logger.info(f"LoRA rank: {args.lora_rank}, alpha: {args.lora_alpha}")
+    logger.info(f"Max steps: {args.max_steps}")
+    logger.info(f"Learning rate: {args.learning_rate}")
+    logger.info(f"Max grad norm: {args.max_grad_norm}")
+    logger.info(f"Output: {output_dir}")
+    logger.info(f"{'='*60}\n")
 
     # Training loop
-    student_unet.train()
-    global_step = 0
-    loss_history = []
-    start_time = time.time()
+    if resume_from_checkpoint:
+        logger.info(f"Resuming training from step {global_step}")
+    else:
+        logger.info("Starting new training run...")
     
-    progress_bar = tqdm(range(args.max_steps), desc="Training")
+    student_unet.train()
+    start_time = time.time()
+    last_log_time = start_time
+    
+    # Initialize progress bar from current step
+    progress_bar = tqdm(range(global_step, args.max_steps), desc="Training", initial=global_step, total=args.max_steps)
+    logger.info(f"Progress bar initialized: step {global_step} to {args.max_steps}")
 
     for epoch in range(1000):
         for batch in dataloader:
@@ -521,8 +681,11 @@ def main():
 
                 accelerator.backward(loss)
                 
+                # Compute gradient norm before clipping
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(student_unet.parameters(), args.max_grad_norm)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(student_unet.parameters(), args.max_grad_norm)
+                else:
+                    grad_norm = None
                 
                 optimizer.step()
                 optimizer.zero_grad()
@@ -532,22 +695,56 @@ def main():
                     loss_history.append(metrics["loss"])
                     
                     progress_bar.update(1)
-                    progress_bar.set_postfix({"loss": f"{metrics['loss']:.4f}"})
+                    progress_bar.set_postfix({
+                        "loss": f"{metrics['loss']:.4f}",
+                        "avg": f"{sum(loss_history[-10:])/min(10, len(loss_history)):.4f}"
+                    })
 
-                    # Log every 50 steps
+                    # Detailed logging every 50 steps
                     if global_step % 50 == 0:
                         avg_loss = sum(loss_history[-50:]) / min(50, len(loss_history))
                         elapsed = time.time() - start_time
-                        print(f"\n[Step {global_step}] Loss: {metrics['loss']:.4f} (avg: {avg_loss:.4f})")
-                        print(f"  Timestep mean: {metrics['timestep_mean']:.0f}")
-                        print(f"  Student/Teacher std: {metrics['student_std']:.4f} / {metrics['teacher_std']:.4f}")
-                        print(f"  Speed: {global_step/elapsed:.2f} steps/sec")
+                        step_time = time.time() - last_log_time
+                        steps_per_sec = 50 / step_time if step_time > 0 else 0
+                        eta_seconds = (args.max_steps - global_step) / steps_per_sec if steps_per_sec > 0 else 0
+                        eta_minutes = eta_seconds / 60
+                        
+                        logger.info(f"\n[Step {global_step}/{args.max_steps}]")
+                        logger.info(f"  Loss: {metrics['loss']:.6f} (avg last 50: {avg_loss:.6f})")
+                        logger.info(f"  Loss range: [{min(loss_history[-50:]):.6f}, {max(loss_history[-50:]):.6f}]")
+                        logger.info(f"  Timesteps: mean={metrics['timestep_mean']:.0f}, range=[{metrics['timestep_min']}, {metrics['timestep_max']}]")
+                        logger.info(f"  Student output: mean={metrics['student_mean']:.4f}, std={metrics['student_std']:.4f}")
+                        logger.info(f"  Teacher target: mean={metrics['teacher_mean']:.4f}, std={metrics['teacher_std']:.4f}")
+                        logger.info(f"  Error range: [{metrics['min_error']:.6f}, {metrics['max_error']:.6f}]")
+                        if grad_norm is not None:
+                            logger.info(f"  Gradient norm: {grad_norm:.4f}")
+                        logger.info(f"  Speed: {steps_per_sec:.2f} steps/sec")
+                        logger.info(f"  ETA: {eta_minutes:.1f} minutes")
+                        
+                        # GPU memory
+                        if torch.cuda.is_available():
+                            mem_allocated = torch.cuda.memory_allocated(accelerator.device) / 1e9
+                            mem_reserved = torch.cuda.memory_reserved(accelerator.device) / 1e9
+                            mem_peak = torch.cuda.max_memory_allocated(accelerator.device) / 1e9
+                            logger.info(f"  GPU Memory: {mem_allocated:.2f} GB allocated, {mem_reserved:.2f} GB reserved, {mem_peak:.2f} GB peak")
+                        
+                        last_log_time = time.time()
 
                     # Checkpoint every 500 steps
                     if global_step % 500 == 0:
                         ckpt_dir = output_dir / f"checkpoint-{global_step}"
                         accelerator.unwrap_model(student_unet).save_pretrained(ckpt_dir)
-                        print(f"  Saved checkpoint: {ckpt_dir}")
+                        logger.info(f"  ✓ Saved checkpoint: {ckpt_dir}")
+                        
+                        # Save training state
+                        checkpoint_info = {
+                            "global_step": global_step,
+                            "loss": metrics["loss"],
+                            "avg_loss": sum(loss_history[-50:]) / min(50, len(loss_history)),
+                            "loss_history": loss_history[-100:],  # Last 100 steps
+                        }
+                        with open(ckpt_dir / "checkpoint_info.json", "w") as f:
+                            json.dump(checkpoint_info, f, indent=2)
 
                     if global_step >= args.max_steps:
                         break
@@ -557,29 +754,56 @@ def main():
 
     # Final save
     total_time = time.time() - start_time
+    logger.info("Saving final checkpoint...")
     accelerator.unwrap_model(student_unet).save_pretrained(output_dir / "final")
     
-    print(f"\n{'='*60}")
-    print("TRAINING COMPLETE")
-    print(f"{'='*60}")
-    print(f"Total steps: {global_step}")
-    print(f"Total time: {total_time/60:.1f} minutes")
-    print(f"Initial loss: {loss_history[0]:.4f}")
-    print(f"Final loss: {loss_history[-1]:.4f}")
-    print(f"Loss change: {loss_history[0] - loss_history[-1]:.4f}")
-    print(f"Saved to: {output_dir / 'final'}")
-    print(f"{'='*60}\n")
+    # Compute training statistics
+    initial_loss = loss_history[0] if len(loss_history) > 0 else 0
+    final_loss = loss_history[-1] if len(loss_history) > 0 else 0
+    loss_change = initial_loss - final_loss
+    avg_final_loss = sum(loss_history[-100:]) / min(100, len(loss_history)) if len(loss_history) > 0 else 0
+    min_loss = min(loss_history) if len(loss_history) > 0 else 0
+    max_loss = max(loss_history) if len(loss_history) > 0 else 0
+    
+    logger.info(f"\n{'='*60}")
+    logger.info("TRAINING COMPLETE")
+    logger.info(f"{'='*60}")
+    logger.info(f"Total steps: {global_step}")
+    logger.info(f"Total time: {total_time/60:.1f} minutes ({total_time/3600:.2f} hours)")
+    logger.info(f"Average speed: {global_step/(total_time/60):.2f} steps/minute")
+    logger.info(f"Initial loss: {initial_loss:.6f}")
+    logger.info(f"Final loss: {final_loss:.6f}")
+    logger.info(f"Average final loss (last 100): {avg_final_loss:.6f}")
+    logger.info(f"Min loss: {min_loss:.6f}")
+    logger.info(f"Max loss: {max_loss:.6f}")
+    logger.info(f"Loss change: {loss_change:.6f} ({loss_change/initial_loss*100:.2f}% reduction)" if initial_loss > 0 else "Loss change: N/A")
+    logger.info(f"Saved to: {output_dir / 'final'}")
+    
+    # GPU memory summary
+    if torch.cuda.is_available():
+        mem_peak = torch.cuda.max_memory_allocated(accelerator.device) / 1e9
+        logger.info(f"Peak GPU memory: {mem_peak:.2f} GB")
+    
+    logger.info(f"{'='*60}\n")
     
     # Save training summary
     summary = {
         "total_steps": global_step,
         "total_time_minutes": total_time / 60,
-        "initial_loss": loss_history[0],
-        "final_loss": loss_history[-1],
+        "total_time_hours": total_time / 3600,
+        "initial_loss": initial_loss,
+        "final_loss": final_loss,
+        "avg_final_loss": avg_final_loss,
+        "min_loss": min_loss,
+        "max_loss": max_loss,
+        "loss_change": loss_change,
+        "loss_change_percent": (loss_change/initial_loss*100) if initial_loss > 0 else None,
         "config": vars(args),
+        "loss_history": loss_history,  # Full history for analysis
     }
     with open(output_dir / "final" / "training_summary.json", "w") as f:
         json.dump(summary, f, indent=2)
+    logger.info(f"Training summary saved to: {output_dir / 'final' / 'training_summary.json'}")
 
 
 if __name__ == "__main__":

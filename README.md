@@ -1,23 +1,24 @@
 # Diffusion Distillation for Fast Text-to-Image Generation
 
-A research implementation of teacher-student distillation for accelerating diffusion models, enabling high-quality text-to-image generation in 2-8 steps with minimal quality degradation.
+A research implementation of teacher-student distillation for accelerating diffusion models, enabling fast text-to-image generation in 2-8 steps with significant speedup.
 
 ## Results
 
 **Hardware**: NVIDIA RTX 4000 Ada 20GB  
-**Evaluation**: 20 prompts × 10 images = 200 images per configuration
+**Evaluation**: 20 prompts × 10 images = 200 images per configuration  
+**Baseline**: Stable Diffusion v1.5 (50 steps, CFG=7.5)
 
 | Configuration | Time/Image | Speedup | CLIP Alignment | Quality Retention |
 |--------------|------------|---------|----------------|-------------------|
-| Baseline (30 steps) | 3.06s | 1.0× | 33.32 | 100% |
-| Flash LoRA (2 steps) | 0.28s | **10.9×** | 33.14 | 99.5% |
-| Flash LoRA (4 steps) | 0.37s | **8.3×** | 33.21 | 99.7% |
-| Flash LoRA (8 steps) | 0.56s | **5.5×** | 33.35 | 100.1% |
+| Baseline (50 steps) | 2.17s | 1.0× | 33.42 | 100% |
+| Flash LoRA (2 steps) | 0.12s | **18.1×** | 21.96 | 65.7% |
+| Flash LoRA (4 steps) | 0.16s | **13.6×** | 21.21 | 63.5% |
+| Flash LoRA (8 steps) | 0.25s | **8.7×** | 20.81 | 62.3% |
 
 **Key Findings**:
-- **10.9× speedup** at 2 steps with 99.5% quality retention
-- Production-ready inference speeds (<0.3s/image)
-- Consistent performance across diverse prompt types
+- **18× speedup** at 2 steps with 66% quality retention
+- Sub-second inference (<0.3s/image) suitable for real-time applications
+- Consistent performance across 20 diverse prompts
 
 ## Demo & Evaluation
 
@@ -53,31 +54,31 @@ K-step distillation aligned with Flash Diffusion / LCM-LoRA:
 - **Key Insight**: Student learns to skip multiple denoising steps at once
 
 ```bash
-# Train on HuggingFace dataset
+# Train on local dataset (COCO)
 python train_flash_lora.py \
-  --dataset_name "lambdalabs/pokemon-blip-captions" \
+  --data_dir /path/to/coco \
   --output_dir ./checkpoints \
-  --run_name "my_lora" \
-  --max_steps 2000 \
-  --batch_size 1 \
-  --gradient_accumulation_steps 4 \
+  --run_name "coco_lora_flash" \
+  --max_steps 3000 \
+  --batch_size 8 \
   --learning_rate 1e-4 \
-  --num_ddim_steps 10 \
+  --num_ddim_steps 8 \
   --num_inference_steps 4
 
-# Evaluate trained LoRA
+# Use trained LoRA
 python demo.py \
-  --lora_path ./checkpoints/my_lora/lora/final \
-  --compare_baseline \
-  --prompt "your prompt here"
+  --lora_path ./checkpoints/coco_lora_flash/lora/final \
+  --prompt "your prompt here" \
+  --steps 4
 ```
 
 **Implementation**:
 - Teacher performs K DDIM steps with CFG to produce target latents
 - Student predicts target in single forward pass (no CFG)
 - Discrete timestep sampling from LCM inference schedule
-- FP16 training with Accelerate, gradient accumulation
+- FP16 training with Accelerate, gradient accumulation, checkpoint resume
 - Only LoRA parameters trainable (base model frozen)
+- Trained on COCO dataset (118K image-caption pairs) for 3000 steps
 
 ## Technical Details
 
